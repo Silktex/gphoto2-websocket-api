@@ -76,10 +76,10 @@ class GPhoto2API:
             camera_list = []
             camera_list_obj = gp.PortInfoList()
             camera_list_obj.load()
-            
+
             abilities_list = gp.CameraAbilitiesList()
             abilities_list.load(self.context)
-            
+
             cameras = abilities_list.detect(camera_list_obj, self.context)
             for idx, camera in enumerate(cameras):
                 # Handle tuple-based output (model, port)
@@ -116,15 +116,15 @@ class GPhoto2API:
             if self.camera is not None:
                 self.camera.exit()
                 self.camera = None
-            
+
             self.camera = gp.Camera()
             self.camera_port = port
-            
+
             port_info_list = gp.PortInfoList()
             port_info_list.load()
             idx = port_info_list.lookup_path(port)
             self.camera.set_port_info(port_info_list.get_info(idx))
-            
+
             self.camera.init(self.context)
             logger.info(f"Camera selected on port {port}")
         except Exception as e:
@@ -142,7 +142,7 @@ class GPhoto2API:
         """
         if not self.camera:
             raise ValueError("No camera selected.")
-        
+
         abilities = self.camera.get_abilities()
         supported_ops = []
         if abilities.operations & gp.GP_OPERATION_CAPTURE_IMAGE:
@@ -171,7 +171,7 @@ class GPhoto2API:
         abilities = self.camera.get_abilities()
         if not abilities.operations & gp.GP_OPERATION_CAPTURE_IMAGE:
             raise ValueError("Camera does not support image capture.")
-        
+
         try:
             file_path = self.camera.capture(gp.GP_CAPTURE_IMAGE, self.context)
             self.last_captured_file = file_path
@@ -194,7 +194,7 @@ class GPhoto2API:
         """
         if not self.camera:
             raise ValueError("No camera selected.")
-        
+
         try:
             folder, filename = os.path.split(camera_filepath)
             with tempfile.NamedTemporaryFile(suffix=f"-{filename}", delete=True) as temp_file:
@@ -225,7 +225,7 @@ class GPhoto2API:
         """
         if not self.camera:
             raise ValueError("No camera selected.")
-        
+
         try:
             config = self.camera.get_config(self.context)
             if config_name:
@@ -257,7 +257,7 @@ class GPhoto2API:
         """
         if not self.camera:
             raise ValueError("No camera selected.")
-        
+
         try:
             config = self.camera.get_config(self.context)
             child = self._find_config_by_name(config, config_name)
@@ -265,7 +265,7 @@ class GPhoto2API:
                 raise ValueError(f"Config '{config_name}' not found.")
             if child.get_readonly():
                 raise ValueError(f"Config '{config_name}' is read-only.")
-            
+
             config_type = child.get_type()
             if config_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO):
                 choices = [child.get_choice(i) for i in range(child.count_choices())]
@@ -288,7 +288,7 @@ class GPhoto2API:
                 child.set_value(timestamp)
             else:
                 child.set_value(value)
-            
+
             self.camera.set_config(config, self.context)
             logger.info(f"Config '{config_name}' set to '{value}'")
             return ConfigDetails(**self._get_config_details(child))
@@ -394,7 +394,7 @@ class GPhoto2API:
 class WebSocketServer:
     def __init__(self):
         """Initialize WebSocket server with environment-based configuration and log detected cameras."""
-        self.host = os.getenv('WS_HOST', 'localhost')
+        self.host = os.getenv('WS_HOST', '0.0.0.0')
         self.port = int(os.getenv('WS_PORT', 8765))
         self.auth_token = os.getenv('API_TOKEN', str(uuid4()))
         self.gphoto_api = GPhoto2API()
@@ -435,18 +435,17 @@ class WebSocketServer:
         except Exception as e:
             logger.error(f"Error detecting cameras: {str(e)}")
 
-    async def handler(self, websocket, path: str):
+    async def handler(self, websocket):
         """Handle WebSocket connection with authentication.
 
         Args:
             websocket: WebSocket connection object.
-            path: WebSocket path.
         """
         client_id = id(websocket)
         client_ip = websocket.remote_address[0]
         logger.info(f"Client connected: {client_id} from {client_ip}")
         self.clients.add(websocket)
-        
+
         try:
             # Authenticate client
             auth_message = await asyncio.wait_for(websocket.recv(), timeout=5.0)
@@ -456,7 +455,9 @@ class WebSocketServer:
                 await websocket.close()
                 logger.warning(f"Authentication failed for client {client_id} from {client_ip}")
                 return
-            
+
+            logger.info(f"Client {client_id} authenticated successfully")
+
             async for message in websocket:
                 try:
                     data = json.loads(message)
@@ -464,6 +465,8 @@ class WebSocketServer:
                     payload = data.get('payload', {})
                     logger.info(f"Received command: {command} with payload: {payload} from {client_ip}")
                     response = await self.process_command(command, payload)
+                    # Add command to response for client handling
+                    response['command'] = command
                     await websocket.send(json.dumps(response))
                 except json.JSONDecodeError:
                     logger.error(f"Invalid JSON from {client_ip}: {message}")
@@ -473,10 +476,12 @@ class WebSocketServer:
                     await websocket.send(json.dumps({"status": "error", "message": str(e)}))
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Client disconnected: {client_id} from {client_ip}")
+        except asyncio.TimeoutError:
+            logger.warning(f"Authentication timeout for client {client_id} from {client_ip}")
         except Exception as e:
             logger.error(f"Unexpected error for client {client_id} from {client_ip}: {str(e)}")
         finally:
-            self.clients.remove(websocket)
+            self.clients.discard(websocket)
 
     async def process_command(self, command: str, payload: Dict) -> Dict:
         """Process a client command.
@@ -560,6 +565,7 @@ class WebSocketServer:
         """Start the WebSocket server."""
         server = await websockets.serve(self.handler, self.host, self.port)
         logger.info(f"WebSocket server started at ws://{self.host}:{self.port}")
+        logger.info(f"API Token: {self.auth_token}")
         try:
             await server.wait_closed()
         except Exception as e:
