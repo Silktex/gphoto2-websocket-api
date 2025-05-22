@@ -394,7 +394,7 @@ class GPhoto2API:
 class WebSocketServer:
     def __init__(self):
         """Initialize WebSocket server with environment-based configuration and log detected cameras."""
-        self.host = os.getenv('WS_HOST', '0.0.0.0')
+        self.host = os.getenv('WS_HOST', 'localhost')
         self.port = int(os.getenv('WS_PORT', 8765))
         self.auth_token = os.getenv('API_TOKEN', str(uuid4()))
         self.gphoto_api = GPhoto2API()

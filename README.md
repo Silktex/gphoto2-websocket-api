@@ -1,4 +1,3 @@
-GPhoto2 WebSocket Server  ***WIP*** Don't use this AI Slop. I will be refining it.
 This project provides a WebSocket server for controlling cameras using the libgphoto2 library via the gphoto2 Python bindings. It allows remote clients to list connected cameras, select a camera, capture images, download images, and manage camera configurations over a WebSocket connection.
 Features
 
@@ -65,7 +64,7 @@ export LOG_LEVEL=DEBUG
 
 
 Run the Server:
-python 2gphoto-websocket.py
+python gphoto2-websocket-server.py
 
 The server starts at ws://localhost:8765 and logs detected cameras and their supported functions.
 
