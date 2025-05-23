@@ -1,584 +1,758 @@
 #!/usr/bin/env python3
+
 import asyncio
+import base64 
 import json
 import logging
-import base64
 import os
-import tempfile
+import re
 import time
-from typing import Dict, List, Optional, Union, Callable, Set, Any
-from contextlib import contextmanager
-from uuid import uuid4
+import shutil # For delete_image_set
+import mimetypes # For get_image_data
 
-import websockets
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# Attempt to import RPi.GPIO and set a flag
+try:
+    import RPi.GPIO as GPIO
+    gpio_imported_successfully = True
+except (ImportError, RuntimeError):
+    gpio_imported_successfully = False
+    GPIO = None 
+
 import gphoto2 as gp
-from pydantic import BaseModel, ValidationError
+import uvicorn
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-# Configure logging with environment variable support
+# Configure logging
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+SETTINGS_REFRESH_INTERVAL = int(os.environ.get("SETTINGS_REFRESH_INTERVAL", "10")) 
+LIVEVIEW_FRAME_INTERVAL = float(os.environ.get("LIVEVIEW_FRAME_INTERVAL", "0.05")) 
+PHOTOMETRIC_CAPTURE_DELAY = float(os.environ.get("PHOTOMETRIC_CAPTURE_DELAY", "0.5")) 
+
+# Base directory for captures and photometric sets
+CAPTURES_BASE_DIR = "captures" # General captures
+PHOTOMETRIC_SETS_BASE_DIR = os.path.join(CAPTURES_BASE_DIR, "photometric_sets")
+
+
 logging.basicConfig(
-    level=os.getenv('LOG_LEVEL', 'INFO').upper(),
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler()]
+    level=LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Pydantic models for input validation
-class SelectCameraPayload(BaseModel):
-    port: str
+# GPIO Pin mapping (BCM mode)
+LIGHT_PINS: Dict[str, int] = {
+    "lights_top": 24, "light_front": 4, "light_front_left": 18, "light_left": 27,
+    "light_rear_left": 22, "light_rear": 3, "light_rear_right": 17, "light_right": 23,
+    "light_front_right": 2
+}
 
-class DownloadImagePayload(BaseModel):
-    camera_filepath: str
+# --- Pydantic Models ---
+class CameraInfo(BaseModel): model: str; port: str
+class ConfigDetails(BaseModel): name: str; label: str; value: Union[str, int, float, bool]; type: str; readonly: bool; options: Optional[List[str]] = None
+class CaptureResponse(BaseModel): message: str; file_path: Optional[str] = None
+class LightStatePayload(BaseModel): light_name: str; state: bool
+class LightStatesInfo(BaseModel): states: Dict[str, bool]; gpio_available: bool
+class SetLightStateResponseData(BaseModel): light_name: str; new_state: bool; gpio_available: bool; message: str
+class LiveviewFrameMessage(BaseModel): action: str = "liveview_frame"; frame: str; mimetype: str = "image/jpeg"
 
-class GetConfigPayload(BaseModel):
-    name: Optional[str] = None
+# Models for Photometric Stereo
+class PhotometricSetPayload(BaseModel): light_sequence: List[str]; set_name_prefix: Optional[str] = None
+class PhotometricProgressData(BaseModel): status: str; current_light: Optional[str] = None; set_folder: str; error_detail: Optional[str] = None
+class PhotometricSetResponseData(BaseModel): message: str; set_folder: str; image_count: Optional[int] = None; images_captured: Optional[List[str]] = None
 
-class SetConfigPayload(BaseModel):
-    name: str
-    value: str
+# Models for Image/Set Management
+class ImageSetContentsPayload(BaseModel): set_name: str
+class DeleteImageSetPayload(BaseModel): set_name: str
+class GetImageDataPayload(BaseModel): image_path: str # Relative to server root, e.g., "captures/photometric_sets/set_name/image.jpg"
 
-class CameraInfo(BaseModel):
-    name: str
-    port: str
-    index: int
+class ImageSetInfo(BaseModel): name: str # Directory name of the set
+class ImageFileDetails(BaseModel): filename: str; path: str # path is relative to server root
+class ImageDataResponse(BaseModel): filename: str; image_b64: str; mimetype: str
 
-class ConfigDetails(BaseModel):
-    config_name: str
-    label: str
-    type: str
-    value: Union[str, float, int]
-    readonly: bool
-    choices: Optional[List[str]] = None
-    range: Optional[Dict[str, float]] = None
-    path: Optional[str] = None
 
-class DownloadImageResponse(BaseModel):
-    filename: str
-    mimetype: str
-    image_b64: str
+class ActionType(str, Enum):
+    GET_CAMERAS = "get_cameras"; SELECT_CAMERA = "select_camera"; GET_CONFIG = "get_config"
+    SET_CONFIG = "set_config"; CAPTURE_IMAGE = "capture_image"; GET_PREVIEW = "get_preview" 
+    DESELECT_CAMERA = "deselect_camera"; SET_LIGHT_STATE = "set_light_state"; GET_LIGHT_STATES = "get_light_states"
+    START_LIVEVIEW = "start_liveview"; STOP_LIVEVIEW = "stop_liveview"
+    CAPTURE_PHOTOMETRIC_SET = "capture_photometric_set"; PHOTOMETRIC_PROGRESS = "photometric_progress"
+    # New actions for Image/Set Management
+    LIST_IMAGE_SETS = "list_image_sets"
+    GET_IMAGE_SET_CONTENTS = "get_image_set_contents"
+    DELETE_IMAGE_SET = "delete_image_set"
+    GET_IMAGE_DATA = "get_image_data"
 
-class GPhoto2API:
+class WebSocketRequest(BaseModel): action: ActionType; payload: Optional[Dict[str, Any]] = None; request_id: Optional[str] = None 
+class WebSocketResponse(BaseModel): action: ActionType; success: bool; data: Optional[Any] = None; error: Optional[str] = None; request_id: Optional[str] = None
+
+
+# --- Light Controller Class ---
+class LightController: # ... (same as before)
     def __init__(self):
-        """Initialize the GPhoto2 API context and camera resources."""
-        self.context = gp.Context()
-        self.camera: Optional[gp.Camera] = None
-        self.camera_port: Optional[str] = None
-        self.last_captured_file: Optional[gp.CameraFilePath] = None
-
-    def list_cameras(self) -> List[CameraInfo]:
-        """List all available cameras.
-
-        Returns:
-            List of CameraInfo objects containing camera name, port, and index.
-        Raises:
-            Exception: If camera detection fails.
-        """
-        try:
-            camera_list = []
-            camera_list_obj = gp.PortInfoList()
-            camera_list_obj.load()
-
-            abilities_list = gp.CameraAbilitiesList()
-            abilities_list.load(self.context)
-
-            cameras = abilities_list.detect(camera_list_obj, self.context)
-            for idx, camera in enumerate(cameras):
-                # Handle tuple-based output (model, port)
-                if isinstance(camera, tuple):
-                    model, port = camera
-                    camera_list.append(CameraInfo(
-                        name=model,
-                        port=port,
-                        index=idx
-                    ))
-                else:
-                    # Handle object-based output
-                    port_info = camera_list_obj.get_info(camera.port)
-                    camera_list.append(CameraInfo(
-                        name=camera.model,
-                        port=port_info.get_path(),
-                        index=idx
-                    ))
-            return camera_list
-        except Exception as e:
-            logger.error(f"Error listing cameras: {str(e)}")
-            raise
-
-    def select_camera(self, port: str) -> None:
-        """Select and initialize a camera by its port.
-
-        Args:
-            port: The camera port path (e.g., 'usb:001,006').
-        Raises:
-            ValueError: If port is invalid.
-            Exception: If camera initialization fails.
-        """
-        try:
-            if self.camera is not None:
-                self.camera.exit()
-                self.camera = None
-
-            self.camera = gp.Camera()
-            self.camera_port = port
-
-            port_info_list = gp.PortInfoList()
-            port_info_list.load()
-            idx = port_info_list.lookup_path(port)
-            self.camera.set_port_info(port_info_list.get_info(idx))
-
-            self.camera.init(self.context)
-            logger.info(f"Camera selected on port {port}")
-        except Exception as e:
-            logger.error(f"Error selecting camera: {str(e)}")
-            self.camera = None
-            raise ValueError(f"Failed to select camera on port {port}: {str(e)}")
-
-    def get_camera_abilities(self) -> List[str]:
-        """Get the supported abilities of the currently selected camera.
-
-        Returns:
-            List of supported operations (e.g., ['capture_image', 'config']).
-        Raises:
-            ValueError: If no camera is selected.
-        """
-        if not self.camera:
-            raise ValueError("No camera selected.")
-
-        abilities = self.camera.get_abilities()
-        supported_ops = []
-        if abilities.operations & gp.GP_OPERATION_CAPTURE_IMAGE:
-            supported_ops.append("capture_image")
-        if abilities.operations & gp.GP_OPERATION_CAPTURE_VIDEO:
-            supported_ops.append("capture_video")
-        if abilities.operations & gp.GP_OPERATION_CAPTURE_PREVIEW:
-            supported_ops.append("capture_preview")
-        if abilities.operations & gp.GP_OPERATION_CONFIG:
-            supported_ops.append("config")
-        if abilities.operations & gp.GP_OPERATION_TRIGGER_CAPTURE:
-            supported_ops.append("trigger_capture")
-        return supported_ops
-
-    def capture_image(self) -> str:
-        """Capture an image and return the camera filepath.
-
-        Returns:
-            The camera filepath (e.g., '/store_00010001/DCIM/100CANON/IMG_0001.JPG').
-        Raises:
-            ValueError: If no camera is selected or capture is not supported.
-            Exception: If capture fails.
-        """
-        if not self.camera:
-            raise ValueError("No camera selected.")
-        abilities = self.camera.get_abilities()
-        if not abilities.operations & gp.GP_OPERATION_CAPTURE_IMAGE:
-            raise ValueError("Camera does not support image capture.")
-
-        try:
-            file_path = self.camera.capture(gp.GP_CAPTURE_IMAGE, self.context)
-            self.last_captured_file = file_path
-            logger.info(f"Image captured: {file_path.folder}/{file_path.name}")
-            return f"{file_path.folder}/{file_path.name}"
-        except Exception as e:
-            logger.error(f"Error capturing image: {str(e)}")
-            raise
-
-    def download_image(self, camera_filepath: str) -> DownloadImageResponse:
-        """Download an image from the camera and return it as base64.
-
-        Args:
-            camera_filepath: Path to the image on the camera.
-        Returns:
-            DownloadImageResponse with filename, MIME type, and base64-encoded image.
-        Raises:
-            ValueError: If no camera is selected or filepath is invalid.
-            Exception: If download fails.
-        """
-        if not self.camera:
-            raise ValueError("No camera selected.")
-
-        try:
-            folder, filename = os.path.split(camera_filepath)
-            with tempfile.NamedTemporaryFile(suffix=f"-{filename}", delete=True) as temp_file:
-                camera_file = self.camera.file_get(folder, filename, gp.GP_FILE_TYPE_NORMAL, self.context)
-                camera_file.save(temp_file.name)
-                temp_file.seek(0)
-                file_data = temp_file.read()
-                base64_data = base64.b64encode(file_data).decode('utf-8')
-                return DownloadImageResponse(
-                    filename=filename,
-                    mimetype=camera_file.get_mime_type(),
-                    image_b64=base64_data
-                )
-        except Exception as e:
-            logger.error(f"Error downloading image {camera_filepath}: {str(e)}")
-            raise
-
-    def get_config(self, config_name: Optional[str] = None) -> Union[List[ConfigDetails], ConfigDetails]:
-        """Get camera configuration(s).
-
-        Args:
-            config_name: Optional specific config name to retrieve.
-        Returns:
-            List of ConfigDetails for all configs if config_name is None, else a single ConfigDetails.
-        Raises:
-            ValueError: If no camera is selected or config_name is not found.
-            Exception: If config retrieval fails.
-        """
-        if not self.camera:
-            raise ValueError("No camera selected.")
-
-        try:
-            config = self.camera.get_config(self.context)
-            if config_name:
-                child = self._find_config_by_name(config, config_name)
-                if not child:
-                    raise ValueError(f"Config '{config_name}' not found.")
-                return ConfigDetails(**self._get_config_details(child))
-            else:
-                configs = []
-                for i in range(config.count_children()):
-                    child = config.get_child(i)
-                    self._extract_config_details(child, configs)
-                return [ConfigDetails(**cfg) for cfg in configs]
-        except Exception as e:
-            logger.error(f"Error getting configs: {str(e)}")
-            raise
-
-    def set_config(self, config_name: str, value: str) -> ConfigDetails:
-        """Set a camera configuration value.
-
-        Args:
-            config_name: The configuration name to set.
-            value: The value to set.
-        Returns:
-            Updated ConfigDetails for the set configuration.
-        Raises:
-            ValueError: If no camera, config is read-only, or value is invalid.
-            Exception: If setting config fails.
-        """
-        if not self.camera:
-            raise ValueError("No camera selected.")
-
-        try:
-            config = self.camera.get_config(self.context)
-            child = self._find_config_by_name(config, config_name)
-            if not child:
-                raise ValueError(f"Config '{config_name}' not found.")
-            if child.get_readonly():
-                raise ValueError(f"Config '{config_name}' is read-only.")
-
-            config_type = child.get_type()
-            if config_type in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO):
-                choices = [child.get_choice(i) for i in range(child.count_choices())]
-                if value not in choices:
-                    raise ValueError(f"Value '{value}' not in choices: {choices}")
-                child.set_value(value)
-            elif config_type == gp.GP_WIDGET_RANGE:
-                float_val = float(value)
-                low, high, inc = child.get_range()
-                if float_val < low or float_val > high:
-                    raise ValueError(f"Value {float_val} out of range [{low}, {high}]")
-                child.set_value(float_val)
-            elif config_type == gp.GP_WIDGET_TOGGLE:
-                int_val = int(value)
-                if int_val not in [0, 1]:
-                    raise ValueError("Toggle value must be 0 or 1")
-                child.set_value(int_val)
-            elif config_type == gp.GP_WIDGET_DATE:
-                timestamp = int(value)
-                child.set_value(timestamp)
-            else:
-                child.set_value(value)
-
-            self.camera.set_config(config, self.context)
-            logger.info(f"Config '{config_name}' set to '{value}'")
-            return ConfigDetails(**self._get_config_details(child))
-        except Exception as e:
-            logger.error(f"Error setting config '{config_name}' to '{value}': {str(e)}")
-            raise
-
-    def _find_config_by_name(self, config, target_name: str, path: str = "") -> Optional[Any]:
-        """Recursively find a config by name."""
-        if config.get_name() == target_name:
-            return config
-        for i in range(config.count_children()):
-            child = config.get_child(i)
-            result = self._find_config_by_name(child, target_name)
-            if result:
-                return result
-        return None
-
-    def _get_config_details(self, config) -> Dict[str, Any]:
-        """Get detailed information about a config item."""
-        details = {
-            "config_name": config.get_name(),
-            "label": config.get_label(),
-            "type": self._get_type_name(config.get_type()),
-            "value": self._get_formatted_value(config),
-            "readonly": config.get_readonly()
-        }
-        if config.get_type() in (gp.GP_WIDGET_MENU, gp.GP_WIDGET_RADIO):
-            details["choices"] = [config.get_choice(i) for i in range(config.count_choices())]
-        if config.get_type() == gp.GP_WIDGET_RANGE:
-            low, high, inc = config.get_range()
-            details["range"] = {"min": low, "max": high, "step": inc}
-        return details
-
-    def _extract_config_details(self, config, results: List[Dict[str, Any]], path: str = "") -> None:
-        """Recursively extract all config details."""
-        try:
-            config_type = config.get_type()
-            if config_type in (gp.GP_WIDGET_SECTION, gp.GP_WIDGET_WINDOW):
-                for i in range(config.count_children()):
-                    child = config.get_child(i)
-                    new_path = f"{path}/{config.get_name()}" if path else config.get_name()
-                    self._extract_config_details(child, results, new_path)
-                return
-            details = self._get_config_details(config)
-            details["path"] = f"{path}/{config.get_name()}" if path else config.get_name()
-            results.append(details)
-        except Exception as e:
-            logger.warning(f"Error extracting config details: {str(e)}")
-
-    def _get_type_name(self, type_val: int) -> str:
-        """Convert numeric type to string name."""
-        type_names = {
-            gp.GP_WIDGET_WINDOW: "window",
-            gp.GP_WIDGET_SECTION: "section",
-            gp.GP_WIDGET_TEXT: "text",
-            gp.GP_WIDGET_RANGE: "range",
-            gp.GP_WIDGET_TOGGLE: "toggle",
-            gp.GP_WIDGET_RADIO: "radio",
-            gp.GP_WIDGET_MENU: "menu",
-            gp.GP_WIDGET_DATE: "date",
-            gp.GP_WIDGET_BUTTON: "button",
-        }
-        return type_names.get(type_val, f"unknown({type_val})")
-
-    def _get_formatted_value(self, config) -> Union[str, float, int]:
-        """Get a formatted value based on config type."""
-        try:
-            config_type = config.get_type()
-            value = config.get_value()
-            if config_type in (gp.GP_WIDGET_TEXT, gp.GP_WIDGET_RADIO, gp.GP_WIDGET_MENU):
-                return str(value) if value is not None else ""
-            elif config_type == gp.GP_WIDGET_RANGE:
-                return float(value) if value is not None else 0.0
-            elif config_type == gp.GP_WIDGET_TOGGLE:
-                return int(value) if value is not None else 0
-            elif config_type == gp.GP_WIDGET_DATE:
-                return int(value) if value is not None else 0
-            return str(value) if value is not None else ""
-        except Exception as e:
-            logger.warning(f"Error formatting value: {str(e)}")
-            return ""
-
-    def cleanup(self) -> None:
-        """Clean up camera resources."""
-        if self.camera:
+        self.gpio_available = gpio_imported_successfully
+        self.light_states: Dict[str, bool] = {name: False for name in LIGHT_PINS.keys()}
+        if self.gpio_available and GPIO:
+            logger.info("RPi.GPIO imported. Initializing GPIO for lights.")
             try:
-                self.camera.exit()
-                logger.info("Camera connection closed.")
-            except Exception as e:
-                logger.error(f"Error closing camera: {str(e)}")
-            finally:
-                self.camera = None
+                GPIO.setmode(GPIO.BCM); GPIO.setwarnings(False)
+                for name, pin in LIGHT_PINS.items(): GPIO.setup(pin, GPIO.OUT); GPIO.output(pin, GPIO.LOW)
+                logger.info("GPIO pins for lights initialized.")
+            except Exception as e: logger.error(f"GPIO init error: {e}. Disabling GPIO."); self.gpio_available = False
+        else: logger.warning("RPi.GPIO not found/failed. Light control stubbed.")
+    def set_light_state(self, light_name: str, state: bool) -> Tuple[bool, str]:
+        if light_name not in LIGHT_PINS: return False, f"Invalid light name: {light_name}."
+        self.light_states[light_name] = state
+        msg_action = "ON" if state else "OFF"
+        if self.gpio_available and GPIO:
+            pin = LIGHT_PINS[light_name]
+            try: GPIO.output(pin, GPIO.HIGH if state else GPIO.LOW); logger.info(f"Light '{light_name}' (pin {pin}) to {msg_action}."); return True, f"Light '{light_name}' turned {msg_action}."
+            except Exception as e: logger.error(f"GPIO error for light '{light_name}': {e}"); return False, f"GPIO error for '{light_name}'."
+        logger.info(f"Mock: Light '{light_name}' to {msg_action} (GPIO not available)."); return True, f"Mock: Light '{light_name}' state {msg_action}."
+    def get_light_states(self) -> Dict[str, bool]: return self.light_states
+    def get_gpio_availability(self) -> bool: return self.gpio_available
+    def cleanup(self):
+        if self.gpio_available and GPIO: logger.info("Cleaning up GPIO."); GPIO.cleanup()
+        else: logger.info("No GPIO cleanup needed.")
 
-    def __enter__(self):
-        """Enter context manager."""
-        return self
+# --- GPhoto2 API Wrapper ---
+class GPhoto2API: # ... (previous methods mostly unchanged, new methods added)
+    _instance = None
+    def __new__(cls, *args, **kwargs): # ... (same)
+        if not cls._instance: cls._instance = super(GPhoto2API, cls).__new__(cls)
+        return cls._instance
+    def __init__(self): # ... (same, ensure new members are initialized if any)
+        if not hasattr(self, "initialized"):
+            self.camera: Optional[gp.Camera] = None; self.context: gp.Context = gp.Context()
+            self.available_cameras: List[CameraInfo] = []; self.selected_camera_info: Optional[CameraInfo] = None
+            self.preview_task = None; self.preview_clients: List[WebSocket] = [] 
+            self.settings_cache: Dict[str, ConfigDetails] = {}; self.cache_refresh_task = None
+            self.light_controller = LightController()
+            self.liveview_active: bool = False; self.current_liveview_websocket: Optional[WebSocket] = None
+            self.initialized = True
+            # Ensure base directories exist at startup
+            os.makedirs(CAPTURES_BASE_DIR, exist_ok=True)
+            os.makedirs(PHOTOMETRIC_SETS_BASE_DIR, exist_ok=True)
+            logger.info(f"GPhoto2API init. Captures dir: '{CAPTURES_BASE_DIR}', Photometric sets dir: '{PHOTOMETRIC_SETS_BASE_DIR}'.")
+            logger.info(f"Settings refresh: {SETTINGS_REFRESH_INTERVAL}s. GPIO: {self.light_controller.get_gpio_availability()}. Liveview FPS: ~{1/LIVEVIEW_FRAME_INTERVAL:.0f}")
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Exit context manager, cleaning up resources."""
-        self.cleanup()
+    # --- Path Validation Helper ---
+    def _is_path_safe(self, base_dir: str, user_provided_path_segment: str) -> bool:
+        """Validates if a path segment is safe and within the base directory."""
+        # Prevent path traversal by ensuring the segment is just a name, not a path itself
+        if ".." in user_provided_path_segment or "/" in user_provided_path_segment or "\\" in user_provided_path_segment:
+            logger.warning(f"Attempted path traversal or invalid characters in segment: '{user_provided_path_segment}'")
+            return False
+        
+        # Construct the full path and normalize it
+        full_path = os.path.normpath(os.path.join(base_dir, user_provided_path_segment))
+        
+        # Check if the normalized full path is still within the intended base directory
+        if not os.path.abspath(full_path).startswith(os.path.abspath(base_dir)):
+            logger.warning(f"Path validation failed: '{full_path}' is outside of base '{base_dir}'")
+            return False
+        return True
 
-class WebSocketServer:
-    def __init__(self):
-        """Initialize WebSocket server with environment-based configuration and log detected cameras."""
-        self.host = os.getenv('WS_HOST', 'localhost')
-        self.port = int(os.getenv('WS_PORT', 8765))
-        self.auth_token = os.getenv('API_TOKEN', str(uuid4()))
-        self.gphoto_api = GPhoto2API()
-        self.clients: Set = set()
-        self.command_handlers: Dict[str, Callable] = {
-            "list_cameras": self.handle_list_cameras,
-            "select_camera": self.handle_select_camera,
-            "capture_image": self.handle_capture_image,
-            "download_last_image": self.handle_download_last_image,
-            "get_config": self.handle_get_config,
-            "set_config": self.handle_set_config,
-        }
-
-        # Log detected cameras and their supported functions
-        self._log_detected_cameras()
-
-    def _log_detected_cameras(self) -> None:
-        """Log detected cameras and their supported functions at startup."""
-        logger.info("Detecting connected cameras...")
+    async def _start_periodic_cache_refresh(self): # ... (same)
+        if self.cache_refresh_task and not self.cache_refresh_task.done(): logger.debug("Cache refresh task already running."); return
+        if self.camera and self.selected_camera_info:
+            logger.info(f"Starting periodic settings cache refresh for {self.selected_camera_info.model}.")
+            self.cache_refresh_task = asyncio.create_task(self._periodic_cache_refresh_loop())
+        else: logger.warning("Cannot start periodic cache refresh: No camera selected.")
+    async def _stop_periodic_cache_refresh(self): # ... (same)
+        if self.cache_refresh_task and not self.cache_refresh_task.done():
+            logger.info("Stopping periodic settings cache refresh task.")
+            self.cache_refresh_task.cancel()
+            try: await self.cache_refresh_task
+            except asyncio.CancelledError: logger.info("Periodic settings cache refresh task cancelled successfully.")
+            except Exception as e: logger.error(f"Error during cache refresh task cancellation: {e}", exc_info=True)
+        self.cache_refresh_task = None
+    async def _periodic_cache_refresh_loop(self): # ... (same)
+        if not self.selected_camera_info: logger.error("Cache refresh loop started without selected camera."); return
+        logger.info(f"Periodic cache refresh loop started for {self.selected_camera_info.model}.")
         try:
-            cameras = self.gphoto_api.list_cameras()
-            if not cameras:
-                logger.info("No cameras detected.")
-                return
-
-            for camera in cameras:
-                logger.info(f"Camera detected: {camera.name} (Port: {camera.port}, Index: {camera.index})")
-                try:
-                    # Temporarily select the camera to check abilities
-                    self.gphoto_api.select_camera(camera.port)
-                    abilities = self.gphoto_api.get_camera_abilities()
-                    logger.info(f"Supported functions for {camera.name}: {', '.join(abilities) or 'None'}")
-                except Exception as e:
-                    logger.warning(f"Could not retrieve abilities for {camera.name}: {str(e)}")
-                finally:
-                    # Ensure cleanup even if abilities retrieval fails
-                    self.gphoto_api.cleanup()
-        except Exception as e:
-            logger.error(f"Error detecting cameras: {str(e)}")
-
-    async def handler(self, websocket):
-        """Handle WebSocket connection with authentication.
-
-        Args:
-            websocket: WebSocket connection object.
-        """
-        client_id = id(websocket)
-        client_ip = websocket.remote_address[0]
-        logger.info(f"Client connected: {client_id} from {client_ip}")
-        self.clients.add(websocket)
-
+            while True:
+                if not self.camera or not self.selected_camera_info: logger.info("Camera deselected. Stopping cache refresh."); break
+                logger.debug(f"Periodic refresh: Updating settings for {self.selected_camera_info.model}.")
+                await self.refresh_full_settings_cache()
+                await asyncio.sleep(SETTINGS_REFRESH_INTERVAL)
+        except asyncio.CancelledError: logger.info(f"Cache refresh loop for {self.selected_camera_info.model if self.selected_camera_info else 'N/A'} cancelled.")
+        except Exception as e: logger.error(f"Error in cache refresh loop for {self.selected_camera_info.model if self.selected_camera_info else 'N/A'}: {e}", exc_info=True)
+        finally: logger.info(f"Cache refresh loop for {self.selected_camera_info.model if self.selected_camera_info else 'N/A'} ended.")
+    async def list_cameras(self) -> List[CameraInfo]: # ... (same)
+        logger.info("Detecting cameras...")
         try:
-            # Authenticate client
-            auth_message = await asyncio.wait_for(websocket.recv(), timeout=5.0)
-            auth_data = json.loads(auth_message)
-            if auth_data.get('token') != self.auth_token:
-                await websocket.send(json.dumps({"status": "error", "message": "Unauthorized"}))
-                await websocket.close()
-                logger.warning(f"Authentication failed for client {client_id} from {client_ip}")
-                return
-
-            logger.info(f"Client {client_id} authenticated successfully")
-
-            async for message in websocket:
-                try:
-                    data = json.loads(message)
-                    command = data.get('command')
-                    payload = data.get('payload', {})
-                    logger.info(f"Received command: {command} with payload: {payload} from {client_ip}")
-                    response = await self.process_command(command, payload)
-                    # Add command to response for client handling
-                    response['command'] = command
-                    await websocket.send(json.dumps(response))
-                except json.JSONDecodeError:
-                    logger.error(f"Invalid JSON from {client_ip}: {message}")
-                    await websocket.send(json.dumps({"status": "error", "message": "Invalid JSON"}))
-                except Exception as e:
-                    logger.error(f"Error processing command from {client_ip}: {str(e)}")
-                    await websocket.send(json.dumps({"status": "error", "message": str(e)}))
-        except websockets.exceptions.ConnectionClosed:
-            logger.info(f"Client disconnected: {client_id} from {client_ip}")
-        except asyncio.TimeoutError:
-            logger.warning(f"Authentication timeout for client {client_id} from {client_ip}")
-        except Exception as e:
-            logger.error(f"Unexpected error for client {client_id} from {client_ip}: {str(e)}")
+            try: gp.check_result(gp.gp_camera_list_free(gp.check_result(gp.gp_camera_list_new(self.context))))
+            except gp.GPhoto2Error as e: logger.warning(f"Minor issue pre-autodetect cleanup: {e}.")
+            cameras_detected = gp.check_result(gp.gp_camera_autodetect())
+            self.available_cameras = [CameraInfo(model=name, port=port) for name, port in cameras_detected]
+            if not self.available_cameras: logger.info("No cameras detected.")
+            else: logger.info(f"Found cameras: {self.available_cameras}")
+            return self.available_cameras
+        except gp.GPhoto2Error as ex: logger.error(f"Error detecting cameras: {ex}"); return []
+    async def select_camera(self, model: Optional[str] = None, port: Optional[str] = None) -> bool: # ... (same)
+        logger.info(f"Attempting to select camera: model={model}, port={port}")
+        if self.camera: logger.info("Camera already selected. Deselecting first."); await self.deselect_camera()
+        await self.list_cameras()
+        if not self.available_cameras: logger.warning("No cameras available."); return False
+        cam_to_select = None
+        if model and port: cam_to_select = next((c for c in self.available_cameras if c.model == model and c.port == port), None)
+        elif model: cam_to_select = next((c for c in self.available_cameras if c.model == model), None)
+        elif port: cam_to_select = next((c for c in self.available_cameras if c.port == port), None)
+        elif self.available_cameras: cam_to_select = self.available_cameras[0]
+        if not cam_to_select: logger.error(f"Camera not found: model='{model}', port='{port}'."); return False
+        port_info_list, driver_list = None, None
+        try:
+            self.camera = gp.Camera()
+            port_info_list = gp.check_result(gp.gp_port_info_list_new(self.context)); gp.check_result(gp.gp_port_info_list_load(port_info_list))
+            pi = gp.check_result(gp.gp_port_info_list_get_info(port_info_list, gp.check_result(gp.gp_port_info_list_lookup_path(port_info_list, cam_to_select.port))))
+            gp.check_result(self.camera.set_port_info(pi))
+            driver_list = gp.check_result(gp.gp_abilities_list_new(self.context)); gp.check_result(gp.gp_abilities_list_load(driver_list, self.context))
+            camera_abilities = gp.check_result(gp.gp_abilities_list_get_abilities(driver_list, gp.check_result(gp.gp_abilities_list_lookup_model(driver_list, cam_to_select.model))))
+            gp.check_result(self.camera.set_abilities(camera_abilities))
+            logger.info(f"Initializing camera: {cam_to_select.model} on port {cam_to_select.port}")
+            self.camera.init(self.context); self.selected_camera_info = cam_to_select
+            logger.info(f"Selected camera: {self.selected_camera_info.model} on port {self.selected_camera_info.port}")
+            await self._populate_settings_cache(); await self._start_periodic_cache_refresh()
+            return True
+        except gp.GPhoto2Error as ex:
+            logger.error(f"Error selecting/initializing camera {cam_to_select.model} ({cam_to_select.port}): {ex}")
+            if self.camera: try: self.camera.exit(self.context) 
+            except gp.GPhoto2Error: pass
+            self.camera, self.selected_camera_info = None, None; self.settings_cache.clear(); await self._stop_periodic_cache_refresh(); return False
         finally:
-            self.clients.discard(websocket)
-
-    async def process_command(self, command: str, payload: Dict) -> Dict:
-        """Process a client command.
-
-        Args:
-            command: The command name.
-            payload: The command payload.
-        Returns:
-            Response dictionary with status and data or error message.
-        """
-        handler = self.command_handlers.get(command)
-        if not handler:
-            return {"status": "error", "message": f"Unknown command: {command}"}
+            if port_info_list: gp.check_result(gp.gp_port_info_list_free(port_info_list))
+            if driver_list: gp.check_result(gp.gp_abilities_list_free(driver_list))
+    async def deselect_camera(self) -> bool: # ... (same, ensures liveview is stopped)
+        await self.stop_liveview(); await self._stop_periodic_cache_refresh()
+        if self.camera and self.selected_camera_info:
+            logger.info(f"Deselecting camera: {self.selected_camera_info.model}")
+            if self.preview_task: self.preview_task.cancel(); await asyncio.gather(self.preview_task, return_exceptions=True)
+            self.preview_task, self.preview_clients = None, []
+            try: self.camera.exit(self.context); logger.info(f"Camera {self.selected_camera_info.model} deselected.")
+            except gp.GPhoto2Error as ex: logger.error(f"Error exiting camera {self.selected_camera_info.model}: {ex}")
+            finally: self.camera, self.selected_camera_info = None, None; self.settings_cache.clear(); return True
+        logger.info("No camera selected to deselect."); self.settings_cache.clear(); return False
+    def _get_widget_by_name_recursive(self, widget_name: str, current_widget: gp.CameraWidget) -> Optional[gp.CameraWidget]: # ... (same)
         try:
-            return await handler(payload)
+            if current_widget.get_name() == widget_name: return current_widget
+        except gp.GPhoto2Error: pass
+        if current_widget.get_type() in [gp.GP_WIDGET_WINDOW, gp.GP_WIDGET_SECTION]:
+            for i in range(current_widget.count_children()):
+                try:
+                    child = current_widget.get_child(i)
+                    if (found := self._get_widget_by_name_recursive(widget_name, child)): return found # type: ignore
+                except gp.GPhoto2Error as e: logger.debug(f"Error accessing child widget: {e}")
+        return None
+    def _extract_config_details(self, widget: gp.CameraWidget) -> Optional[ConfigDetails]: # ... (same)
+        try:
+            widget_name = widget.get_name(); widget_type_id = widget.get_type()
+            if not widget_name or widget_type_id in [gp.GP_WIDGET_WINDOW, gp.GP_WIDGET_SECTION, gp.GP_WIDGET_BUTTON]: return None
+            label, value, readonly = widget.get_label(), widget.get_value(), widget.get_readonly()
+            type_map = {gp.GP_WIDGET_TEXT: "text", gp.GP_WIDGET_RANGE: "range", gp.GP_WIDGET_TOGGLE: "toggle", gp.GP_WIDGET_RADIO: "radio", gp.GP_WIDGET_MENU: "menu", gp.GP_WIDGET_DATE: "date"}
+            type_str = type_map.get(widget_type_id, f"unknown (ID: {widget_type_id})")
+            options = [str(c) for c in widget.get_choices()] if widget_type_id in [gp.GP_WIDGET_RADIO, gp.GP_WIDGET_MENU] else None
+            if widget_type_id == gp.GP_WIDGET_TOGGLE: value = bool(value)
+            elif widget_type_id == gp.GP_WIDGET_RANGE and isinstance(value, (int, float)): 
+                try: value = float(value)
+                except ValueError: pass 
+            return ConfigDetails(name=widget_name, label=label, value=value, type=type_str, readonly=readonly, options=options)
+        except gp.GPhoto2Error as e: logger.warning(f"Error extracting details for widget '{getattr(widget, 'get_name', lambda: 'N/A')()}': {e}. Skipping."); return None
+    def _get_all_configs_recursive(self, widget: gp.CameraWidget, current_config_map: Dict[str, ConfigDetails]): # ... (same)
+        if not widget: return
+        if details := self._extract_config_details(widget): # type: ignore
+            if details.name in current_config_map: logger.warning(f"Duplicate config name '{details.name}'. Overwriting.")
+            current_config_map[details.name] = details
+        if widget.get_type() in [gp.GP_WIDGET_WINDOW, gp.GP_WIDGET_SECTION]:
+            for i in range(widget.count_children()):
+                try: self._get_all_configs_recursive(widget.get_child(i), current_config_map)
+                except gp.GPhoto2Error as e: logger.error(f"Error getting child widget from '{getattr(widget, 'get_name', lambda: 'N/A')()}': {e}")
+    async def _populate_settings_cache(self, is_periodic_refresh: bool = False): # ... (same)
+        if not self.camera or not self.selected_camera_info:
+            if not is_periodic_refresh: logger.warning("No camera selected. Cannot populate cache.")
+            self.settings_cache.clear(); return
+        log_prefix = "Periodic refresh: " if is_periodic_refresh else ""
+        logger.info(f"{log_prefix}Populating settings cache for {self.selected_camera_info.model}...")
+        new_cache: Dict[str, ConfigDetails] = {}
+        try:
+            self._get_all_configs_recursive(self.camera.get_config(self.context), new_cache)
+            if is_periodic_refresh and self.settings_cache != new_cache: logger.info(f"{log_prefix}Cache updated with {len(new_cache)} items. Changes detected.")
+            elif is_periodic_refresh: logger.debug(f"{log_prefix}Cache checked, no changes.")
+            self.settings_cache = new_cache
+            if not is_periodic_refresh: logger.info(f"Cache populated with {len(self.settings_cache)} items.")
+        except gp.GPhoto2Error as ex:
+            logger.error(f"{log_prefix}Error populating cache for {self.selected_camera_info.model}: {ex}")
+            if not is_periodic_refresh: self.settings_cache.clear()
         except Exception as e:
-            logger.error(f"Error in command {command}: {str(e)}")
-            return {"status": "error", "message": str(e)}
-
-    async def handle_list_cameras(self, payload: Dict) -> Dict:
-        """Handle list_cameras command."""
-        cameras = self.gphoto_api.list_cameras()
-        return {"status": "ok", "cameras": [camera.dict() for camera in cameras]}
-
-    async def handle_select_camera(self, payload: Dict) -> Dict:
-        """Handle select_camera command."""
+            logger.error(f"{log_prefix}Unexpected error populating cache: {e}", exc_info=True)
+            if not is_periodic_refresh: self.settings_cache.clear()
+    async def refresh_full_settings_cache(self): # ... (same)
+        logger.debug(f"refresh_full_settings_cache called for {self.selected_camera_info.model if self.selected_camera_info else 'N/A'}")
+        await self._populate_settings_cache(is_periodic_refresh=True)
+    async def get_config(self, config_name: Optional[str] = None) -> Union[List[ConfigDetails], ConfigDetails, None]: # ... (same)
+        if not self.camera or not self.selected_camera_info: logger.warning("No camera selected."); return None
+        if not self.settings_cache: logger.info("Cache empty. Populating before get_config."); await self._populate_settings_cache(False)
+        if not self.settings_cache and not config_name: logger.warning("Failed to populate cache. Cannot get all configs."); return [] 
+        if not self.settings_cache and config_name : logger.warning(f"Failed to populate cache. Cannot get config {config_name}"); return None
+        if config_name:
+            if config_name in self.settings_cache: return self.settings_cache[config_name]
+            logger.warning(f"Config '{config_name}' not in cache. Refreshing once."); await self._populate_settings_cache(False)
+            if config_name in self.settings_cache: return self.settings_cache[config_name]
+            logger.error(f"Config '{config_name}' not found after refresh."); return None
+        return list(self.settings_cache.values())
+    async def set_config(self, config_name: str, value: Any) -> bool: # ... (same as before, ensure full type conv. logic)
+        if not self.camera or not self.selected_camera_info: logger.warning("No camera selected."); return False
+        logger.info(f"Setting config '{config_name}' to '{value}' on {self.selected_camera_info.model}")
         try:
-            validated = SelectCameraPayload(**payload)
-            self.gphoto_api.select_camera(validated.port)
-            return {"status": "ok", "message": f"Camera on port {validated.port} selected"}
-        except ValidationError as e:
-            return {"status": "error", "message": f"Invalid payload: {str(e)}"}
-
-    async def handle_capture_image(self, payload: Dict) -> Dict:
-        """Handle capture_image command."""
-        camera_filepath = self.gphoto_api.capture_image()
-        return {
-            "status": "ok",
-            "message": "Image captured successfully",
-            "camera_filepath": camera_filepath
-        }
-
-    async def handle_download_last_image(self, payload: Dict) -> Dict:
-        """Handle download_last_image command."""
+            config_tree_root = self.camera.get_config(self.context)
+            widget = self._get_widget_by_name_recursive(config_name, config_tree_root)
+            if not widget:
+                logger.error(f"Widget '{config_name}' not found. Refreshing cache once."); await self._populate_settings_cache(False)
+                if config_name not in self.settings_cache: logger.error(f"'{config_name}' still not in cache."); return False
+                config_tree_root = self.camera.get_config(self.context); widget = self._get_widget_by_name_recursive(config_name, config_tree_root)
+                if not widget: logger.error(f"'{config_name}' in cache but widget search failed again."); return False
+            parsed_value = value; widget_type = widget.get_type() 
+            if widget_type == gp.GP_WIDGET_RADIO or widget_type == gp.GP_WIDGET_MENU:
+                choices = list(widget.get_choices()); parsed_value = str(value)
+                if str(value) not in choices:
+                    try: value_idx = int(value); parsed_value = choices[value_idx] if 0 <= value_idx < len(choices) else (_ for _ in ()).throw(ValueError("Index out of bounds")) # type: ignore
+                    except: logger.error(f"Invalid choice/index '{value}' for '{config_name}'. Avail: {choices}"); return False
+            elif widget_type == gp.GP_WIDGET_TOGGLE:
+                if isinstance(value, str): parsed_value = 1 if value.lower() in ["on", "true", "1"] else (0 if value.lower() in ["off", "false", "0"] else (_ for _ in ()).throw(ValueError("Invalid toggle string"))) # type: ignore
+                elif isinstance(value, bool): parsed_value = int(value)
+                elif not (isinstance(value, int) and value in [0,1]): logger.error(f"Invalid toggle type '{type(value)}'"); return False
+            elif widget_type == gp.GP_WIDGET_RANGE: 
+                try: parsed_value = float(value)
+                except: logger.error(f"Invalid range value '{value}'"); return False
+            elif widget_type == gp.GP_WIDGET_TEXT: parsed_value = str(value)
+            elif widget_type == gp.GP_WIDGET_DATE:
+                try: parsed_value = int(value)
+                except: logger.error(f"Invalid date value '{value}'"); return False
+            if widget.get_readonly(): logger.error(f"Config '{config_name}' is read-only."); return False
+            widget.set_value(parsed_value); self.camera.set_config(config_tree_root, self.context)
+            logger.info(f"Successfully set '{config_name}' to '{parsed_value}'.")
+            if updated_details := self._extract_config_details(widget): self.settings_cache[config_name] = updated_details # type: ignore
+            else: logger.warning(f"Could not re-extract details for '{config_name}' after set. Refreshing all."); await self._populate_settings_cache(False)
+            return True
+        except gp.GPhoto2Error as ex: logger.error(f"GPhoto2Error setting '{config_name}': {ex}"); await self._populate_settings_cache(False); return False
+        except Exception as e: logger.error(f"Error setting '{config_name}': {e}", exc_info=True); await self._populate_settings_cache(False); return False
+    async def capture_image(self, download: bool = True) -> Optional[CaptureResponse]: # ... (same)
+        if not self.camera or not self.selected_camera_info: logger.warning("No camera for capture."); return None
+        logger.info(f"Capturing image ({'download' if download else 'on-camera'}) with {self.selected_camera_info.model}")
         try:
-            validated = DownloadImagePayload(**payload)
-            image_data = self.gphoto_api.download_image(validated.camera_filepath)
-            return {
-                "status": "ok",
-                "message": "Image downloaded successfully",
-                **image_data.dict()
-            }
-        except ValidationError as e:
-            return {"status": "error", "message": f"Invalid payload: {str(e)}"}
-
-    async def handle_get_config(self, payload: Dict) -> Dict:
-        """Handle get_config command."""
-        try:
-            validated = GetConfigPayload(**payload)
-            config_data = self.gphoto_api.get_config(validated.name)
-            if validated.name:
-                return {"status": "ok", **config_data.dict()}
-            return {"status": "ok", "configs": [cfg.dict() for cfg in config_data]}
-        except ValidationError as e:
-            return {"status": "error", "message": f"Invalid payload: {str(e)}"}
-
-    async def handle_set_config(self, payload: Dict) -> Dict:
-        """Handle set_config command."""
-        try:
-            validated = SetConfigPayload(**payload)
-            config_data = self.gphoto_api.set_config(validated.name, validated.value)
-            return {
-                "status": "ok",
-                "message": f"Config {validated.name} set to {validated.value}",
-                **config_data.dict()
-            }
-        except ValidationError as e:
-            return {"status": "error", "message": f"Invalid payload: {str(e)}"}
-
-    async def start(self):
-        """Start the WebSocket server."""
-        server = await websockets.serve(self.handler, self.host, self.port)
-        logger.info(f"WebSocket server started at ws://{self.host}:{self.port}")
-        logger.info(f"API Token: {self.auth_token}")
-        try:
-            await server.wait_closed()
-        except Exception as e:
-            logger.error(f"Server error: {str(e)}")
+            while self.camera and self.selected_camera_info and self.preview_clients:
+                try:
+                    cap_file = self.camera.capture_preview(self.context)
+                    if not cap_file or not (frame_bytes := memoryview(cap_file.get_data_and_size()).tobytes()): # type: ignore
+                        logger.warning("Raw preview capture returned no data."); await asyncio.sleep(0.1); continue
+                    for client_ws in list(self.preview_clients): 
+                        try: await client_ws.send_bytes(frame_bytes)
+                        except WebSocketDisconnect: logger.info(f"Raw preview client {client_ws.client} disconnected."); self.preview_clients.remove(client_ws) if client_ws in self.preview_clients else None
+                        except Exception as e: logger.error(f"Error sending raw preview to {client_ws.client}: {e}"); self.preview_clients.remove(client_ws) if client_ws in self.preview_clients else None
+                    fail_count = 0; await asyncio.sleep(0.03) 
+                except gp.GPhoto2Error as ex:
+                    fail_count += 1; logger.error(f"GPhoto2Error raw previewing: {ex} (Fail {fail_count}/{max_fails})")
+                    if "Camera is already capturing" in str(ex) or "Could not claim USB" in str(ex): await asyncio.sleep(1)
+                    elif fail_count >= max_fails: logger.error("Max raw preview errors. Stopping."); break
+                    else: await asyncio.sleep(0.5)
+                except Exception as e: logger.error(f"Unexpected raw preview error: {e}", exc_info=True); break
+        except asyncio.CancelledError: logger.info(f"Raw preview task for {self.selected_camera_info.model if self.selected_camera_info else 'N/A'} cancelled.")
         finally:
-            self.gphoto_api.cleanup()
-
-if __name__ == "__main__":
-    with GPhoto2API() as gphoto_api:
-        server = WebSocketServer()
+            logger.info(f"Raw preview task for {self.selected_camera_info.model if self.selected_camera_info else 'N/A'} ended.")
+            self.preview_task = None; err_resp = WebSocketResponse(action=ActionType.GET_PREVIEW, success=False, error="Raw preview stream ended or failed.").dict()
+            for client_ws in list(self.preview_clients): 
+                try: await client_ws.send_json(err_resp)
+                except: pass 
+            self.preview_clients.clear()
+    async def start_liveview(self, websocket: WebSocket, request_id: Optional[str] = None): # ... (same Base64 liveview)
+        ack_action = ActionType.START_LIVEVIEW 
+        if not self.camera or not self.selected_camera_info:
+            logger.warning("Liveview: No camera selected."); await websocket.send_json(WebSocketResponse(action=ack_action, success=False, error="No camera selected.", request_id=request_id).dict()); return
+        if self.liveview_active or self.current_liveview_websocket:
+            logger.warning(f"Liveview already active."); await websocket.send_json(WebSocketResponse(action=ack_action, success=False, error="Liveview already active.", request_id=request_id).dict()); return
         try:
-            asyncio.run(server.start())
-        except KeyboardInterrupt:
-            logger.info("Server stopped by user")
+            abilities = self.camera.get_abilities()
+            if not (abilities.operations & gp.GP_OPERATION_CAPTURE_PREVIEW):
+                logger.warning(f"Camera {self.selected_camera_info.model} no preview support."); await websocket.send_json(WebSocketResponse(action=ack_action, success=False, error="Camera no preview support.", request_id=request_id).dict()); return
+        except gp.GPhoto2Error as e:
+            logger.error(f"Error checking preview abilities: {e}"); await websocket.send_json(WebSocketResponse(action=ack_action, success=False, error=f"Error checking preview abilities: {e}", request_id=request_id).dict()); return
+        self.liveview_active = True; self.current_liveview_websocket = websocket
+        logger.info(f"Starting B64 JSON liveview for {websocket.client} on {self.selected_camera_info.model}.")
+        await websocket.send_json(WebSocketResponse(action=ack_action, success=True, data={"message": "Liveview stream initiated."}, request_id=request_id).dict())
+        fail_count = 0; max_fails = 5
+        try:
+            while self.liveview_active and self.camera and self.selected_camera_info:
+                if self.current_liveview_websocket != websocket: logger.warning("Liveview ws mismatch. Stopping."); break
+                try:
+                    capture = self.camera.capture_preview(self.context)
+                    if not capture or not (file_data_view := capture.get_data_and_size()): logger.warning("Liveview: no data."); await asyncio.sleep(0.1); continue # type: ignore
+                    frame_bytes = file_data_view.tobytes(); base64_data = base64.b64encode(frame_bytes).decode('utf-8')
+                    await self.current_liveview_websocket.send_json(LiveviewFrameMessage(frame=base64_data).dict())
+                    fail_count = 0; await asyncio.sleep(LIVEVIEW_FRAME_INTERVAL) 
+                except gp.GPhoto2Error as ex:
+                    fail_count += 1; logger.error(f"GPhoto2Error liveview: {ex} (Fail {fail_count})")
+                    if fail_count >= max_fails: logger.error(f"Max GPhoto2 errors liveview. Stopping."); await self.current_liveview_websocket.send_json(WebSocketResponse(action=ActionType.STOP_LIVEVIEW, success=False, error=f"Liveview fail: {ex}").dict()); break 
+                    await asyncio.sleep(0.5) 
+                except WebSocketDisconnect: logger.info(f"Liveview client {websocket.client} disconnected."); break 
+                except Exception as e: logger.error(f"Unexpected liveview error: {e}", exc_info=True); await self.current_liveview_websocket.send_json(WebSocketResponse(action=ActionType.STOP_LIVEVIEW, success=False, error=f"Liveview server error: {e}").dict()); break 
+        except asyncio.CancelledError: logger.info(f"Liveview stream cancelled.")
+        finally:
+            logger.info(f"Liveview stream ended.")
+            self.liveview_active = False
+            if self.current_liveview_websocket == websocket: self.current_liveview_websocket = None
+    async def stop_liveview(self): # ... (same Base64 liveview)
+        logger.info("Stopping Base64 JSON liveview."); self.liveview_active = False
+
+    async def capture_image_for_set(self, set_folder_name: str, file_basename: str) -> Optional[CaptureResponse]: # ... (same)
+        if not self.camera or not self.selected_camera_info: logger.warning("Photometric: No camera selected."); return None
+        target_set_dir = os.path.join(PHOTOMETRIC_SETS_BASE_DIR, set_folder_name)
+        try: os.makedirs(target_set_dir, exist_ok=True)
+        except OSError as e: logger.error(f"Photometric: Error creating dir {target_set_dir}: {e}"); return None
+        if '.' not in file_basename: file_basename += ".jpg" 
+        target_path_on_server = os.path.join(target_set_dir, file_basename)
+        logger.info(f"Photometric: Capturing for set '{set_folder_name}' to '{target_path_on_server}'")
+        try:
+            file_path_on_camera = self.camera.capture(gp.GP_CAPTURE_IMAGE, self.context)
+            logger.info(f"Photometric: Captured on camera: {file_path_on_camera.folder}/{file_path_on_camera.name}")
+            camera_file_obj = self.camera.file_get(file_path_on_camera.folder, file_path_on_camera.name, gp.GP_FILE_TYPE_NORMAL, self.context)
+            camera_file_obj.save(target_path_on_server); logger.info(f"Photometric: Saved to {target_path_on_server}")
+            return CaptureResponse(message="Image captured for set.", file_path=target_path_on_server)
+        except gp.GPhoto2Error as ex: logger.error(f"Photometric: GPhoto2Error capturing for set: {ex}"); return None
+        except Exception as e: logger.error(f"Photometric: Unexpected error capturing for set: {e}", exc_info=True); return None
+    async def run_photometric_sequence(self, websocket: WebSocket, set_name_prefix: Optional[str], light_sequence: List[str], request_id: Optional[str]): # ... (same)
+        if not self.camera or not self.selected_camera_info: await websocket.send_json(WebSocketResponse(action=ActionType.CAPTURE_PHOTOMETRIC_SET, success=False, error="No camera selected.", request_id=request_id).dict()); return
+        if not self.light_controller.get_gpio_availability(): await websocket.send_json(WebSocketResponse(action=ActionType.CAPTURE_PHOTOMETRIC_SET, success=False, error="GPIO not available.", request_id=request_id).dict()); return
+        if not light_sequence: await websocket.send_json(WebSocketResponse(action=ActionType.CAPTURE_PHOTOMETRIC_SET, success=False, error="Light sequence empty.", request_id=request_id).dict()); return
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        folder_name_part = f"{set_name_prefix}_{timestamp}" if set_name_prefix else f"photometric_set_{timestamp}"
+        safe_folder_name = re.sub(r'[^\w\-.]', '_', folder_name_part)
+        captured_image_paths: List[str] = []; sequence_failed = False; error_message = ""
+        logger.info(f"Starting photometric sequence. Set: {safe_folder_name}, Lights: {light_sequence}")
+        for light_name_to_reset in LIGHT_PINS.keys(): self.light_controller.set_light_state(light_name_to_reset, False)
+        await asyncio.sleep(0.1)
+        for idx, light_name in enumerate(light_sequence):
+            if light_name not in LIGHT_PINS:
+                error_detail = f"Invalid light name '{light_name}'"; logger.error(f"Photometric: {error_detail}")
+                await websocket.send_json(WebSocketResponse(action=ActionType.PHOTOMETRIC_PROGRESS, success=False, data=PhotometricProgressData(status=f"error_light_{idx+1}", current_light=light_name, set_folder=safe_folder_name, error_detail=error_detail).dict(), request_id=request_id).dict())
+                sequence_failed = True; error_message = error_detail; break 
+            progress_data = PhotometricProgressData(status=f"processing_light_{idx+1}_of_{len(light_sequence)}", current_light=light_name, set_folder=safe_folder_name)
+            await websocket.send_json(WebSocketResponse(action=ActionType.PHOTOMETRIC_PROGRESS, success=True, data=progress_data.dict(), request_id=request_id).dict())
+            set_ok, msg = self.light_controller.set_light_state(light_name, True)
+            if not set_ok:
+                error_detail = f"Failed to turn ON light: {light_name} ({msg})"; logger.error(f"Photometric: {error_detail}")
+                await websocket.send_json(WebSocketResponse(action=ActionType.PHOTOMETRIC_PROGRESS, success=False, data=PhotometricProgressData(status=f"error_light_{idx+1}", current_light=light_name, set_folder=safe_folder_name, error_detail=error_detail).dict(), request_id=request_id).dict())
+                sequence_failed = True; error_message = error_detail; break
+            await asyncio.sleep(PHOTOMETRIC_CAPTURE_DELAY)
+            file_basename = f"image_{idx+1:02d}_{light_name}"
+            capture_response = await self.capture_image_for_set(set_folder_name=safe_folder_name, file_basename=file_basename)
+            self.light_controller.set_light_state(light_name, False) # Turn light OFF
+            if not capture_response or not capture_response.file_path:
+                error_detail = f"Capture failed for light: {light_name}. Reason: {capture_response.message if capture_response else 'Unknown'}"
+                logger.error(f"Photometric: {error_detail}")
+                await websocket.send_json(WebSocketResponse(action=ActionType.PHOTOMETRIC_PROGRESS, success=False, data=PhotometricProgressData(status=f"error_light_{idx+1}", current_light=light_name, set_folder=safe_folder_name, error_detail=error_detail).dict(), request_id=request_id).dict())
+                sequence_failed = True; error_message = error_detail; break
+            captured_image_paths.append(os.path.relpath(capture_response.file_path, CAPTURES_BASE_DIR)) # Store relative to 'captures'
+            await asyncio.sleep(PHOTOMETRIC_CAPTURE_DELAY / 2)
+        for light_name_to_off in LIGHT_PINS.keys(): self.light_controller.set_light_state(light_name_to_off, False)
+        final_data = PhotometricSetResponseData(message=f"Sequence {'failed: ' + error_message if sequence_failed else 'completed.'}", set_folder=safe_folder_name, image_count=len(captured_image_paths), images_captured=captured_image_paths)
+        await websocket.send_json(WebSocketResponse(action=ActionType.CAPTURE_PHOTOMETRIC_SET, success=not sequence_failed, error=error_message if sequence_failed else None, data=final_data.dict(), request_id=request_id).dict())
+        logger.info(f"Photometric sequence for {safe_folder_name} ended. Success: {not sequence_failed}")
+
+    # --- New Image/Set Management Methods ---
+    async def list_image_sets(self) -> List[ImageSetInfo]:
+        set_infos: List[ImageSetInfo] = []
+        if not os.path.exists(PHOTOMETRIC_SETS_BASE_DIR) or not os.path.isdir(PHOTOMETRIC_SETS_BASE_DIR):
+            logger.info("Photometric sets base directory does not exist or is not a directory.")
+            return set_infos # Return empty list
+        try:
+            for item_name in os.listdir(PHOTOMETRIC_SETS_BASE_DIR):
+                if os.path.isdir(os.path.join(PHOTOMETRIC_SETS_BASE_DIR, item_name)):
+                    # Basic validation: ensure item_name is a simple directory name
+                    if ".." not in item_name and "/" not in item_name and "\\" not in item_name:
+                         set_infos.append(ImageSetInfo(name=item_name))
+                    else:
+                        logger.warning(f"Skipping potentially unsafe directory name: {item_name}")
+            return sorted(set_infos, key=lambda x: x.name, reverse=True) # Sort by name, newest first if timestamped
+        except OSError as e:
+            logger.error(f"Error listing image sets in {PHOTOMETRIC_SETS_BASE_DIR}: {e}")
+            return [] # Return empty on error
+
+    async def get_image_set_contents(self, set_name: str) -> Optional[List[ImageFileDetails]]:
+        if not self._is_path_safe(PHOTOMETRIC_SETS_BASE_DIR, set_name):
+            logger.error(f"Access denied or invalid set name for get_image_set_contents: {set_name}")
+            return None
+        
+        set_dir_path = os.path.join(PHOTOMETRIC_SETS_BASE_DIR, set_name)
+        if not os.path.exists(set_dir_path) or not os.path.isdir(set_dir_path):
+            logger.warning(f"Image set '{set_name}' not found at {set_dir_path}.")
+            return None
+
+        image_files: List[ImageFileDetails] = []
+        allowed_extensions = ('.jpg', '.jpeg', '.png', '.cr2', '.nef', '.arw') # Common image extensions
+        try:
+            for filename in os.listdir(set_dir_path):
+                if filename.lower().endswith(allowed_extensions):
+                    full_file_path = os.path.join(set_dir_path, filename)
+                    if os.path.isfile(full_file_path):
+                        # Return path relative to server root (or a defined media root)
+                        # For simplicity here, relative to where the server is run from.
+                        relative_path = os.path.relpath(full_file_path, os.getcwd()) 
+                        # Normalize to use forward slashes for web paths
+                        web_friendly_path = relative_path.replace("\\", "/")
+                        image_files.append(ImageFileDetails(filename=filename, path=web_friendly_path))
+            return sorted(image_files, key=lambda x: x.filename)
+        except OSError as e:
+            logger.error(f"Error reading contents of image set '{set_name}': {e}")
+            return None
+
+    async def delete_image_set(self, set_name: str) -> bool:
+        if not self._is_path_safe(PHOTOMETRIC_SETS_BASE_DIR, set_name):
+            logger.error(f"Access denied or invalid set name for delete_image_set: {set_name}")
+            return False
+        
+        set_dir_path = os.path.join(PHOTOMETRIC_SETS_BASE_DIR, set_name)
+        if not os.path.exists(set_dir_path) or not os.path.isdir(set_dir_path):
+            logger.warning(f"Cannot delete: Image set '{set_name}' not found at {set_dir_path}.")
+            return False
+        
+        try:
+            shutil.rmtree(set_dir_path)
+            logger.info(f"Successfully deleted image set: {set_dir_path}")
+            return True
+        except OSError as e:
+            logger.error(f"Error deleting image set '{set_name}' at {set_dir_path}: {e}")
+            return False
+
+    async def get_image_data(self, image_path: str) -> Optional[ImageDataResponse]:
+        # Crucial security: Ensure image_path is within allowed directories (e.g., CAPTURES_BASE_DIR)
+        # Normalize the user-provided path and the allowed base path
+        normalized_image_path = os.path.normpath(image_path)
+        absolute_image_path = os.path.abspath(normalized_image_path)
+        absolute_captures_base = os.path.abspath(CAPTURES_BASE_DIR)
+
+        if not absolute_image_path.startswith(absolute_captures_base):
+            logger.error(f"Security: Access denied for image path outside '{CAPTURES_BASE_DIR}': {image_path}")
+            return None
+        
+        # Double check for any traversal components that might have been missed if image_path was absolute
+        if ".." in normalized_image_path:
+             logger.error(f"Security: Path traversal suspected in '{image_path}' despite normalization.")
+             return None
+
+        if not os.path.exists(absolute_image_path) or not os.path.isfile(absolute_image_path):
+            logger.warning(f"Image file not found or not a file: {absolute_image_path}")
+            return None
+        
+        try:
+            with open(absolute_image_path, "rb") as f:
+                image_bytes = f.read()
+            
+            base64_data = base64.b64encode(image_bytes).decode('utf-8')
+            mimetype, _ = mimetypes.guess_type(absolute_image_path)
+            if not mimetype:
+                mimetype = 'application/octet-stream' # Default if type can't be guessed
+            
+            return ImageDataResponse(
+                filename=os.path.basename(absolute_image_path),
+                image_b64=base64_data,
+                mimetype=mimetype
+            )
+        except IOError as e:
+            logger.error(f"IOError reading image file '{absolute_image_path}': {e}")
+            return None
         except Exception as e:
-            logger.error(f"Fatal error: {str(e)}")
+            logger.error(f"Unexpected error getting image data for '{absolute_image_path}': {e}", exc_info=True)
+            return None
+
+
+    async def cleanup(self): # ... (same, ensures all tasks and controllers are cleaned up)
+        logger.info("Cleaning up GPhoto2API resources...")
+        await self.stop_liveview(); await self._stop_periodic_cache_refresh()
+        if self.preview_task and not self.preview_task.done(): self.preview_task.cancel(); await asyncio.gather(self.preview_task, return_exceptions=True)
+        if self.camera:
+            try: self.camera.exit(self.context); logger.info("Camera exited.")
+            except gp.GPhoto2Error as ex: logger.error(f"Error exiting camera: {ex}")
+        self.camera, self.selected_camera_info = None, None
+        self.settings_cache.clear(); self.preview_clients.clear()
+        if self.light_controller: self.light_controller.cleanup()
+        logger.info("GPhoto2API cleanup complete.")
+
+# --- FastAPI Application & Connection Manager (handle_message needs updates) ---
+app = FastAPI(title="gphoto2 WebSocket Server")
+gphoto_api_singleton = GPhoto2API() 
+app.add_middleware( CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+@app.on_event("startup")
+async def startup_event(): logger.info("Application startup...")
+@app.on_event("shutdown")
+async def shutdown_event(): logger.info("Application shutdown requested..."); await gphoto_api_singleton.cleanup()
+
+class ConnectionManager: # ... (same structure, handle_message updated)
+    def __init__(self, api_instance: GPhoto2API):
+        self.active_connections: List[WebSocket] = []
+        self.gphoto_api = api_instance 
+    async def connect(self, websocket: WebSocket): # ... (same)
+        await websocket.accept(); self.active_connections.append(websocket)
+        logger.info(f"Client {websocket.client} connected. Total: {len(self.active_connections)}")
+    async def disconnect(self, websocket: WebSocket): # ... (same, ensures liveview is stopped)
+        if websocket in self.active_connections: self.active_connections.remove(websocket)
+        logger.info(f"Client {websocket.client} disconnected.")
+        await self.gphoto_api.stop_preview(websocket) 
+        if self.gphoto_api.current_liveview_websocket == websocket:
+            logger.info(f"Client {websocket.client} was active liveview client. Stopping liveview.")
+            await self.gphoto_api.stop_liveview() 
+        if not self.active_connections and not self.gphoto_api.preview_clients and not self.gphoto_api.liveview_active:
+            if self.gphoto_api.selected_camera_info:
+                logger.info("Last client disconnected & no active streams. Deselecting camera.")
+                await self.gphoto_api.deselect_camera()
+    async def send_response(self, websocket: WebSocket, action: Union[ActionType, str], success: bool, data: Optional[Any] = None, error: Optional[str] = None, request_id: Optional[str] = None): # ... (same)
+        action_str = action.value if isinstance(action, ActionType) else action
+        response = WebSocketResponse(action=action_str, success=success, data=data, error=error, request_id=request_id) # type: ignore
+        try: await websocket.send_json(response.dict())
+        except WebSocketDisconnect: logger.warning(f"Client {websocket.client} disconnected before response for '{action_str}' (ReqID: {request_id}).")
+        except Exception as e: logger.error(f"Error sending JSON for '{action_str}' (ReqID: {request_id}) to {websocket.client}: {e}")
+
+    async def handle_message(self, websocket: WebSocket, message: str): # Modified for new actions
+        req_id: Optional[str] = None; parsed_req: Optional[WebSocketRequest] = None; action_str = "unknown_action"
+        try:
+            json_data = json.loads(message); req_id = json_data.get("request_id"); action_str = json_data.get("action", "unknown_action")
+            parsed_req = WebSocketRequest(**json_data)
+            logger.info(f"Action '{parsed_req.action.value}' from {websocket.client}" + (f" (ReqID: {req_id})" if req_id else ""))
+            payload = parsed_req.payload or {}
+
+            # Existing actions ... (condensed for brevity, assume they are the same)
+            if parsed_req.action == ActionType.GET_CAMERAS: await self.send_response(websocket, parsed_req.action, True, data=[c.dict() for c in await self.gphoto_api.list_cameras()], request_id=req_id)
+            elif parsed_req.action == ActionType.SELECT_CAMERA:
+                success = await self.gphoto_api.select_camera(payload.get("model"), payload.get("port"))
+                data = self.gphoto_api.selected_camera_info.dict() if success and self.gphoto_api.selected_camera_info else None
+                await self.send_response(websocket, parsed_req.action, success, data=data, error=None if success else "Failed to select camera.", request_id=req_id)
+            elif parsed_req.action == ActionType.DESELECT_CAMERA: await self.send_response(websocket, parsed_req.action, True, data={"message": "Camera deselected." if await self.gphoto_api.deselect_camera() else "No camera selected."}, request_id=req_id)
+            elif parsed_req.action == ActionType.GET_CONFIG:
+                if not self.gphoto_api.selected_camera_info: await self.send_response(websocket, parsed_req.action, False, error="No camera selected.", request_id=req_id); return
+                cfg_data = await self.gphoto_api.get_config(payload.get("config_name"))
+                data = [c.dict() for c in cfg_data] if isinstance(cfg_data, list) else (cfg_data.dict() if cfg_data else None)
+                await self.send_response(websocket, parsed_req.action, cfg_data is not None, data=data, error=None if cfg_data is not None else "Config not found/failed.", request_id=req_id)
+            elif parsed_req.action == ActionType.SET_CONFIG:
+                if not self.gphoto_api.selected_camera_info: await self.send_response(websocket, parsed_req.action, False, error="No camera selected.", request_id=req_id); return
+                cfg_name, value = payload.get("config_name"), payload.get("value")
+                if cfg_name is None or value is None: await self.send_response(websocket, parsed_req.action, False, error="config_name and value required.", request_id=req_id); return
+                success = await self.gphoto_api.set_config(cfg_name, value)
+                updated_cfg = await self.gphoto_api.get_config(cfg_name) if success else None
+                await self.send_response(websocket, parsed_req.action, success, data=updated_cfg.dict() if updated_cfg else None, error=None if success else f"Failed to set config '{cfg_name}'.", request_id=req_id)
+            elif parsed_req.action == ActionType.CAPTURE_IMAGE: 
+                if not self.gphoto_api.selected_camera_info: await self.send_response(websocket, parsed_req.action, False, error="No camera selected.", request_id=req_id); return
+                cap_res = await self.gphoto_api.capture_image(payload.get("download", True))
+                await self.send_response(websocket, parsed_req.action, cap_res is not None, data=cap_res.dict() if cap_res else None, error=None if cap_res else "Failed to capture image.", request_id=req_id)
+            elif parsed_req.action == ActionType.GET_PREVIEW: 
+                if not self.gphoto_api.selected_camera_info: await self.send_response(websocket, parsed_req.action, False, error="No camera selected.", request_id=req_id); return
+                await self.gphoto_api.start_preview(websocket); await self.send_response(websocket, parsed_req.action, True, data={"message": "Raw byte preview stream requested."}, request_id=req_id)
+            elif parsed_req.action == ActionType.GET_LIGHT_STATES:
+                states = self.gphoto_api.light_controller.get_light_states(); gpio_avail = self.gphoto_api.light_controller.get_gpio_availability()
+                await self.send_response(websocket, parsed_req.action, True, data=LightStatesInfo(states=states, gpio_available=gpio_avail).dict(), request_id=req_id)
+            elif parsed_req.action == ActionType.SET_LIGHT_STATE:
+                try: light_payload = LightStatePayload(**payload)
+                except Exception as e: await self.send_response(websocket, parsed_req.action, False, error=f"Invalid payload: {e}", request_id=req_id); return
+                success, message = self.gphoto_api.light_controller.set_light_state(light_payload.light_name, light_payload.state)
+                response_data = SetLightStateResponseData(light_name=light_payload.light_name, new_state=self.gphoto_api.light_controller.light_states.get(light_payload.light_name, light_payload.state), gpio_available=self.gphoto_api.light_controller.get_gpio_availability(), message=message)
+                await self.send_response(websocket, parsed_req.action, success, data=response_data.dict(), request_id=req_id)
+            elif parsed_req.action == ActionType.START_LIVEVIEW: await self.gphoto_api.start_liveview(websocket, req_id)
+            elif parsed_req.action == ActionType.STOP_LIVEVIEW:
+                await self.gphoto_api.stop_liveview()
+                await self.send_response(websocket, parsed_req.action, True, data={"message": "Liveview stream stopped."}, request_id=req_id)
+            elif parsed_req.action == ActionType.CAPTURE_PHOTOMETRIC_SET:
+                try:
+                    photometric_payload = PhotometricSetPayload(**payload)
+                    if not photometric_payload.light_sequence: await self.send_response(websocket, parsed_req.action, False, error="Light sequence cannot be empty.", request_id=req_id); return
+                    asyncio.create_task(self.gphoto_api.run_photometric_sequence(websocket, photometric_payload.set_name_prefix, photometric_payload.light_sequence, req_id))
+                except Exception as e: logger.error(f"Invalid payload for CAPTURE_PHOTOMETRIC_SET: {e}", exc_info=True); await self.send_response(websocket, parsed_req.action, False, error=f"Invalid payload: {e}", request_id=req_id)
+            
+            # New Image/Set Management actions
+            elif parsed_req.action == ActionType.LIST_IMAGE_SETS:
+                sets_data = await self.gphoto_api.list_image_sets()
+                await self.send_response(websocket, parsed_req.action, True, data=[s.dict() for s in sets_data], request_id=req_id)
+            
+            elif parsed_req.action == ActionType.GET_IMAGE_SET_CONTENTS:
+                try:
+                    contents_payload = ImageSetContentsPayload(**payload)
+                    contents_data = await self.gphoto_api.get_image_set_contents(contents_payload.set_name)
+                    if contents_data is not None:
+                        await self.send_response(websocket, parsed_req.action, True, data=[c.dict() for c in contents_data], request_id=req_id)
+                    else:
+                        await self.send_response(websocket, parsed_req.action, False, error=f"Set '{contents_payload.set_name}' not found or empty.", request_id=req_id)
+                except Exception as e: # Pydantic validation error
+                    await self.send_response(websocket, parsed_req.action, False, error=f"Invalid payload for get_image_set_contents: {e}", request_id=req_id)
+
+            elif parsed_req.action == ActionType.DELETE_IMAGE_SET:
+                try:
+                    delete_payload = DeleteImageSetPayload(**payload)
+                    success = await self.gphoto_api.delete_image_set(delete_payload.set_name)
+                    if success:
+                        await self.send_response(websocket, parsed_req.action, True, data={"message": f"Set '{delete_payload.set_name}' deleted successfully."}, request_id=req_id)
+                    else:
+                        await self.send_response(websocket, parsed_req.action, False, error=f"Failed to delete set '{delete_payload.set_name}'. It might not exist or an error occurred.", request_id=req_id)
+                except Exception as e: # Pydantic validation error
+                    await self.send_response(websocket, parsed_req.action, False, error=f"Invalid payload for delete_image_set: {e}", request_id=req_id)
+
+            elif parsed_req.action == ActionType.GET_IMAGE_DATA:
+                try:
+                    image_data_payload = GetImageDataPayload(**payload)
+                    image_data = await self.gphoto_api.get_image_data(image_data_payload.image_path)
+                    if image_data:
+                        await self.send_response(websocket, parsed_req.action, True, data=image_data.dict(), request_id=req_id)
+                    else:
+                        await self.send_response(websocket, parsed_req.action, False, error=f"Image not found or access denied: {image_data_payload.image_path}", request_id=req_id)
+                except Exception as e: # Pydantic validation error
+                    await self.send_response(websocket, parsed_req.action, False, error=f"Invalid payload for get_image_data: {e}", request_id=req_id)
+            
+            else: 
+                logger.warning(f"Unknown action '{parsed_req.action}' (ReqID: {req_id})")
+                await self.send_response(websocket, parsed_req.action, False, error="Unknown action.", request_id=req_id)
+        except json.JSONDecodeError: logger.error(f"Invalid JSON from {websocket.client}: {message}"); await self.send_response(websocket, action_str, False, error="Invalid JSON.", request_id=req_id)
+        except Exception as e: logger.error(f"Error processing msg (Action: {action_str}, ReqID: {req_id}): {e}", exc_info=True); await self.send_response(websocket, action_str, False, error=f"Server error: {e}", request_id=req_id)
+
+manager = ConnectionManager(api_instance=gphoto_api_singleton)
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket): # ... (same)
+    await manager.connect(websocket)
+    try:
+        while True: await manager.handle_message(websocket, await websocket.receive_text())
+    except WebSocketDisconnect: logger.debug(f"Client {websocket.client} triggered WebSocketDisconnect.")
+    except Exception as e: logger.error(f"Error in WebSocket endpoint for {websocket.client}: {e}", exc_info=True); await asyncio.gather(websocket.close(code=1011, reason=str(e)), return_exceptions=True)
+    finally: await manager.disconnect(websocket)
+
+# --- CLI Helpers (condensed, assume same as before) ---
+async def _get_camera_abilities_cli(gphoto_api: GPhoto2API, model:str, port:str) -> Optional[Dict]: # ... (same)
+    logger.info(f"Getting abilities for {model} on {port} (CLI mode)...")
+    if await gphoto_api.select_camera(model, port):
+        abilities_text = f"Abilities for {model} (details from cache or direct query)"; cfg_names = list(gphoto_api.settings_cache.keys())[:5]
+        await gphoto_api.deselect_camera(); return {"model": model, "port": port, "abilities": abilities_text, "cached_config_names": cfg_names}
+    return None
+async def _log_detected_cameras_details_cli(gphoto_api_instance: GPhoto2API): # ... (same)
+    logger.info("CLI: Attempting to log details for all detected cameras...")
+    cameras = await gphoto_api_instance.list_cameras()
+    for cam_info in cameras:
+        details = await _get_camera_abilities_cli(gphoto_api_instance, cam_info.model, cam_info.port)
+        if details: logger.info(f"Camera: {details['model']}, Port: {details['port']}, Abilities: {details['abilities']}, Sample Configs: {details['cached_config_names']}")
+
+# --- Main Execution ---
+if __name__ == "__main__": # ... (same)
+    import argparse
+    parser = argparse.ArgumentParser(description="gphoto2 WebSocket Server with Full Features")
+    parser.add_argument("--host",type=str,default="0.0.0.0",help="Host (0.0.0.0)"); parser.add_argument("--port",type=int,default=8000,help="Port (8000)")
+    parser.add_argument("--log-cameras",action="store_true",help="List cameras info and exit.")
+    cli_args = parser.parse_args()
+    logger.info(f"GPIO Available: {gpio_imported_successfully}. Liveview FPS: ~{1/LIVEVIEW_FRAME_INTERVAL:.0f}. Photometric delay: {PHOTOMETRIC_CAPTURE_DELAY}s")
+    if cli_args.log_cameras:
+        logger.info("Log cameras mode: Will list cameras and exit.")
+        async def log_and_exit():
+            try: await _log_detected_cameras_details_cli(gphoto_api_singleton)
+            except Exception as e: logger.error(f"Error --log-cameras: {e}", exc_info=True)
+            finally: logger.info("Log cameras finished. Cleaning up."); await gphoto_api_singleton.cleanup(); os._exit(0) 
+        try: asyncio.run(log_and_exit())
+        except KeyboardInterrupt: logger.info("Log cameras cancelled."); asyncio.run(gphoto_api_singleton.cleanup()); os._exit(0)
+    else:
+        logger.info(f"Starting Uvicorn server on {cli_args.host}:{cli_args.port}")
+        uvicorn.run( "__main__:app", host=cli_args.host, port=cli_args.port, ws_max_size=16 * 1024 * 1024) # type: ignore
+```
