@@ -343,45 +343,6 @@ class GPhoto2API: # ... (previous methods mostly unchanged, new methods added)
         if not self.camera or not self.selected_camera_info: logger.warning("No camera for capture."); return None
         logger.info(f"Capturing image ({'download' if download else 'on-camera'}) with {self.selected_camera_info.model}")
         try:
-            file_path_on_camera = self.camera.capture(gp.GP_CAPTURE_IMAGE, self.context)
-            logger.info(f"Captured on camera: {file_path_on_camera.folder}/{file_path_on_camera.name}")
-            if not download: return CaptureResponse(message="Captured on camera, not downloaded.")
-            timestamp = time.strftime("%Y%m%d-%H%M%S"); base, ext = os.path.splitext(file_path_on_camera.name)
-            safe_model_name = re.sub(r'[^\w-]', '_', self.selected_camera_info.model)
-            target_filename = f"{base}_{safe_model_name}_{timestamp}{ext}"
-            # Save to general captures directory
-            target_path_on_server = os.path.join(CAPTURES_BASE_DIR, target_filename)
-            os.makedirs(CAPTURES_BASE_DIR, exist_ok=True) # Ensure general captures dir exists
-
-            logger.info(f"Downloading image to: {target_path_on_server}")
-            camera_file_obj = self.camera.file_get(
-                file_path_on_camera.folder, file_path_on_camera.name, gp.GP_FILE_TYPE_NORMAL, self.context
-            )
-            camera_file_obj.save(target_path_on_server)
-            logger.info(f"Image saved to {target_path_on_server}")
-            return CaptureResponse(message="Image captured and downloaded.", file_path=target_path_on_server)
-        except gp.GPhoto2Error as ex: logger.error(f"Error capturing image: {ex}"); return None
-
-    async def start_preview(self, websocket: WebSocket): # ... (same raw preview)
-        if not self.camera or not self.selected_camera_info:
-            await websocket.send_json(WebSocketResponse(action=ActionType.GET_PREVIEW, success=False, error="No camera selected.").dict()); return
-        if websocket not in self.preview_clients: self.preview_clients.append(websocket)
-        logger.info(f"Client {websocket.client} added for raw preview from {self.selected_camera_info.model}.")
-        if self.preview_task and not self.preview_task.done(): logger.info("Raw preview task already running."); return
-        logger.info(f"Starting raw preview stream for {self.selected_camera_info.model}.")
-        self.preview_task = asyncio.create_task(self._stream_preview())
-    async def stop_preview(self, websocket: WebSocket): # ... (same raw preview)
-        if websocket in self.preview_clients: self.preview_clients.remove(websocket)
-        logger.info(f"Client {websocket.client} removed from raw preview.")
-        if not self.preview_clients and self.preview_task and not self.preview_task.done():
-            logger.info("No more raw preview clients. Stopping task.")
-            self.preview_task.cancel(); await asyncio.gather(self.preview_task, return_exceptions=True)
-            self.preview_task = None
-    async def _stream_preview(self): # ... (same raw preview)
-        if not self.camera or not self.selected_camera_info: logger.error("Raw preview stream: no camera."); return
-        logger.info(f"Raw preview task started for {self.selected_camera_info.model}.")
-        max_fails = 10; fail_count = 0
-        try:
             while self.camera and self.selected_camera_info and self.preview_clients:
                 try:
                     cap_file = self.camera.capture_preview(self.context)
